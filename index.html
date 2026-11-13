@@ -475,7 +475,7 @@
 <div class="modal-overlay" id="importModal">
   <div class="import-box">
     <h3 style="margin-bottom:4px;font-weight:700;">Import Weekly Report</h3>
-    <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:16px;">Upload the Excel attendance file from your timeclock system. For scheduled vs. worked, drop the When I Work <strong>Shifts</strong> report and <strong>Timesheets</strong> export (both at once is fine).</p>
+    <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:16px;">Upload the Excel attendance file from your timeclock system. For scheduled vs. worked, drop the When I Work <strong>Schedule</strong> export (&ldquo;Schedule for &hellip;xlsx&rdquo;) and, if you have it, the <strong>Timesheets</strong> export (both at once is fine).</p>
     <div class="drop-zone" id="dropZone">
       <p><strong>Drop .xlsx file(s) here</strong><br>or click to browse</p>
     </div>
@@ -1031,7 +1031,12 @@ function processFile(file) {
       const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
       if (!rows.length) { toast('File appears empty', 'error'); return; }
       const cols = Object.keys(rows[0]);
-      if (cols.some(c => /employee.?(id|number|no)/i.test(c)) && cols.some(c => /first.?name/i.test(c)) && cols.some(c => /last.?name/i.test(c))) { parseEmployeeList(rows, cols); return; }
+      if (cols.some(c => /employee.?(id|number|no)/i.test(c)) && cols.some(c => /first.?name/i.test(c)) && cols.some(c => /last.?name/i.test(c))) {
+        // The Schedule export's hours-per-day sheet also has Employee ID + First/Last Name.
+        // Never let it replace the employee list.
+        if (cols.some(c => /^(total|scheduled) hours$/i.test(c.trim()))) { toast('That looks like a schedule hours sheet, not an employee list. Use the full When I Work Schedule export (it has a Schedules sheet with shift times).', 'error'); return; }
+        parseEmployeeList(rows, cols); return;
+      }
       const nameCol = cols.find(c => /^name$/i.test(c.trim())) || cols.find(c => /name/i.test(c));
       const dateCol = cols.find(c => /^date$/i.test(c.trim())) || cols.find(c => /date/i.test(c));
       const typeCol = cols.find(c => /^type$/i.test(c.trim())) || cols.find(c => /type/i.test(c));
@@ -2358,6 +2363,9 @@ function detectScheduleFile(wb) {
     const cols = Object.keys(rows[0]);
     const has = re => cols.some(c => re.test(c.trim()));
     if (has(/^assignee name$/i) && has(/^start (date|time)$/i)) return { kind: 'shifts', rows, cols };
+    // When I Work Schedule export ("Schedule for Nov 9 2026 - Nov 15 2026.xlsx"): one row per
+    // shift on the "Schedules" sheet, after an hours-per-day "Hourly" sheet
+    if (has(/^first name$/i) && has(/^last name$/i) && has(/^shift start date$/i) && has(/^shift start time$/i)) return { kind: 'shifts', rows, cols };
     if (has(/^first name$/i) && has(/^last name$/i) && has(/^start time$/i) && has(/^end time$/i) && has(/^(regular|paid total|unpaid breaks)$/i)) return { kind: 'punches', rows, cols };
   }
   return null;
@@ -2386,21 +2394,28 @@ const putIn = (obj, pk, ds, id, rec) => { ((obj[pk] = obj[pk] || {})[ds] = obj[p
 // coming up or in progress when the report was pulled is never flagged.
 function parseShiftsReport(rows, cols, cap) {
   const col = re => cols.find(c => re.test(c.trim()));
-  const nameC = col(/^assignee name$/i), idC = col(/^shift id$/i), sdC = col(/^start date$/i), stC = col(/^start time$/i),
-        edC = col(/^end date$/i), etC = col(/^end time$/i), posC = col(/^position( name)?$/i), tcC = col(/^has timeclock entry$/i);
-  const out = { kind: 'shifts', data: {}, names: {}, from: '', to: '', count: 0, a: '', noTc: !tcC };
+  // Shifts report: "Assignee Name", "Start Date"... Schedule export: "First Name" + "Last Name", "Shift Start Date"...
+  const nameC = col(/^assignee name$/i), fnC = col(/^first name$/i), lnC = col(/^last name$/i), idC = col(/^shift id$/i),
+        sdC = col(/^(shift )?start date$/i), stC = col(/^(shift )?start time$/i),
+        edC = col(/^(shift )?end date$/i), etC = col(/^(shift )?end time$/i), posC = col(/^position( name)?$/i), tcC = col(/^has timeclock entry$/i),
+        statusC = col(/^status$/i), openC = col(/^openshift count$/i);
+  const out = { kind: 'shifts', src: nameC ? 'report' : 'export', data: {}, names: {}, from: '', to: '', count: 0, a: '', noTc: !tcC };
+  const str = v => (v == null ? '' : v).toString().trim();
   let seen = '';
   rows.forEach((r, n) => {
     const s = xlCombine(sdC ? r[sdC] : '', stC ? r[stC] : '');
     if (!s) return;
     const ds = s.slice(0, 10);
     out.from = minStr(out.from, ds); out.to = maxStr(out.to, ds);
-    const name = (r[nameC] || '').toString().trim();
-    const pos = posC ? (r[posC] || '').toString().trim() : '';
+    const fn = fnC ? str(r[fnC]) : '', ln = lnC ? str(r[lnC]) : '';
+    const name = nameC ? str(r[nameC]) : [fn, ln].filter(Boolean).join(' ');
+    const pos = posC ? str(r[posC]) : '';
     const tc = tcC ? xlBool(r[tcC]) : undefined;
     if (tc === true) seen = maxStr(seen, s);
-    if (!name || schedSkip(name, pos)) return; // OpenShift (nobody assigned) or a manager
-    const nm = splitName(name), pk = schedKeyFor(nm.fn, nm.ln);
+    if (statusC && /unpublished|draft/i.test(str(r[statusC]))) return; // not on the posted schedule
+    if (!name || /^open ?shift$/i.test(name) || (openC && Number(r[openC]) > 0)) return; // OpenShift (nobody assigned)
+    if (schedSkip(name, pos)) return; // a manager
+    const nm = nameC ? splitName(name) : { fn, ln }, pk = schedKeyFor(nm.fn, nm.ln);
     const e = fixEnd(s, xlCombine(edC ? r[edC] : (sdC ? r[sdC] : ''), etC ? r[etC] : '')) || s;
     const rec = { s, e, pos };
     if (tc !== undefined) rec.tc = tc;
@@ -2477,6 +2492,7 @@ function judgeDay(shiftsObj, punchesObj, punchAsOf, cellVal) {
     } else {
       const ended = (sh.tc === false && sh.a && dtMin(sh.a) >= e) || (punchAsOf && dtMin(punchAsOf) >= e);
       r.status = ended ? (excused ? 'callout' : 'absent') : 'pending';
+      if (sh.tc === undefined) r.noTc = true; // Schedule export: times only, no clock-in info
     }
     return r;
   });
@@ -2501,6 +2517,7 @@ function schedOutcome(r) {
   if (r.status === 'worked') return 'Clocked in (add the Timesheets export for exact times)';
   if (r.status === 'absent') return 'No clock-in on record';
   if (r.status === 'callout') return 'No clock-in; marked Excused / NYC-PS&STO in the tracker';
+  if (r.noTc) return 'Clock-in not checked (add the Timesheets export)';
   return 'Not checked yet (shift hadn’t ended when the report was pulled)';
 }
 function schedRangeText(r) { return fmt12(r.s) + ' – ' + fmt12(r.e); }
@@ -2618,12 +2635,12 @@ function renderSchedPreview() {
   let html = '<p style="margin-bottom:6px"><strong>Schedule</strong> <span style="color:var(--text-muted)">(shows scheduled days on the grid, no points added)</span></p>';
   if (ps.shifts) {
     const people = Object.keys(ps.shifts.data).length;
-    html += `<div class="sp-file ok">&#10003; Shifts report: ${ps.shifts.count} shifts for ${people} people, ${rng(ps.shifts)}</div>`;
+    html += `<div class="sp-file ok">&#10003; ${ps.shifts.src === 'export' ? 'Schedule export' : 'Shifts report'}: ${ps.shifts.count} shifts for ${people} people, ${rng(ps.shifts)}</div>`;
   } else {
-    html += '<div class="sp-file">&#9675; Shifts report (scheduled days) not added</div>';
+    html += '<div class="sp-file">&#9675; Schedule export (scheduled days) not added</div>';
   }
   if (ps.punches) html += `<div class="sp-file ok">&#10003; Timesheets: ${ps.punches.count} clock-ins, ${rng(ps.punches)} (exact in/out times when you click a day)</div>`;
-  if (!ps.shifts && !Object.keys(schedData.shifts || {}).length) html += '<div class="sp-hint">Add the Shifts report too. Timesheets alone can\u2019t show which days were scheduled.</div>';
+  if (!ps.shifts && !Object.keys(schedData.shifts || {}).length) html += '<div class="sp-hint">Add the Schedule export too. Timesheets alone can\u2019t show which days were scheduled.</div>';
   el.innerHTML = html;
   el.style.display = 'block';
   document.getElementById('confirmImportBtn').style.display = 'inline-flex';
